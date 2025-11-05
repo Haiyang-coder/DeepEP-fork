@@ -45,17 +45,26 @@ def test_main(num_tokens: int,
               use_logfmt: bool = False,
               shrink_test: bool = False,
               seed: int = 0):
+    # 这里的seed是一个随机种子
     torch.manual_seed(seed + rank)
     random.seed(seed + rank)
 
+    #这里需要均分
     assert num_experts % num_ranks == 0
     num_local_experts = num_experts // num_ranks
 
     # NOTES: the integers greater than 256 exceed the BF16 precision limit
+    # 大于256的整数会超过BF16的精度限制
     rank_offset = 128
     assert num_ranks - rank_offset < 257, 'Too many ranks (exceeding test precision limit)'
 
+    # 这段代码主要是在 构造一批用于测试或模拟推理的张量输入（x_list）
+    # 包含了不同分布、不同数值范围的 BF16（bfloat16）Tensor，用于后续性能或格式转换（如 LogFMT）测试。
+    # 创建一个形状为 (num_tokens, hidden) 的张量，全 1；
+    # 数据类型是 BF16，放在 GPU 上
+    # 乘以 (rank - rank_offset)，所以不同 rank 的 GPU 上会得到不同数值的张量
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * (rank - rank_offset)
+    # 将每行的最后 128 个元素替换为从 0 ~ num_tokens-1 的 BF16 序列；当于给每个 token 附加一个递增标识；常用于验证 数据对齐、精度保持 或 分布式通信后数据是否正确。
     x[:, -128:] = torch.arange(num_tokens, device='cuda').to(torch.bfloat16).view(-1, 1)
     x_list = [x]
     for _ in range(4 if use_logfmt else 0):
@@ -65,16 +74,25 @@ def test_main(num_tokens: int,
     # Most of the values in the perf case is lower than the threshold, casting most channels
     x_list.append(torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * 0.1)
 
+    #模拟每个 token 被路由到哪些专家（expert）以及对应的权重。
+    # 生成一个形状为 [num_tokens, num_experts] 的随机分数矩阵；每一行对应一个 token，对应的列是各个 expert 的得分；
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
+    # 每个 token 只选择topk个专家来计算
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
     topk_idx = topk_idx.to(deep_ep.topk_idx_t)
+    # 给每一个专家生成一个随机的权重, 这里用的权重是随机生成的
     topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda').abs()
 
     # Randomly mask some positions
+    # 这里的随机掩码,吧一些专家强行去掉了?为什么
+    # 随机吧10个位置的专家去掉了, m模拟网络数据丢失的健壮性?
     for _ in range(10):
         topk_idx[random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)] = -1
 
+    # 将所有rank的tokens的topk都收集一遍
     all_topk_idx = torch.empty((num_ranks, num_tokens, num_topk), dtype=topk_idx.dtype, device='cuda')
+
+    # all gather通信, 将所有的rank上构造的topk_idx 构造成一个巨大的 all_topk_idx
     dist.all_gather_into_tensor(all_topk_idx, topk_idx, group=group)
 
     # For failure simulation and shrink testing
@@ -85,15 +103,21 @@ def test_main(num_tokens: int,
     do_check = True
     hash_value, num_times = 0, 0
     for current_x in x_list:
+        # 是否启用接收hook
         for return_recv_hook in (False, True):
+            # 是否使用FP8来dispatch
             for dispatch_use_fp8 in (False, True):
+                #dispatch_use_fp8 是true的时候才有意义, 是否要四舍五入
                 for round_scale in (False, True) if dispatch_use_fp8 else (False, ):
+                    # UE8M0 算法是否要用
                     for use_ue8m0 in (False, True) if round_scale else (False, ):
+                        # 是否是缩减测试或者模拟测试失败跳过下面的逻辑
                         if shrink_test and simulate_failure_and_skip(rank, "dispatch", expected_masked_ranks):
                             break
                         num_times += 1
                         for _ in range((num_times % 2) + 1):
                             cumulative_local_expert_recv_stats = torch.zeros((num_local_experts, ), dtype=torch.int, device='cuda')
+                            # 开始进行 low_latency_dispatch 了
                             packed_recv_x, packed_recv_count, handle, event, hook = \
                                 buffer.low_latency_dispatch(current_x, topk_idx, num_tokens, num_experts,
                                                             use_fp8=dispatch_use_fp8, round_scale=round_scale, use_ue8m0=use_ue8m0,
@@ -254,10 +278,13 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     num_tokens, hidden = args.num_tokens, args.hidden
     num_topk, num_experts = args.num_topk, args.num_experts
-
+    # 这里计算了low_latency_rdma_size_hint函数，用于计算低延迟通信所需的RDMA缓冲区大小
     num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(num_tokens, hidden, num_ranks, num_experts)
     if local_rank == 0:
         print(f'Allocating buffer size: {num_rdma_bytes / 1e6} MB ...', flush=True)
+    # 这里注意,buffer中 没有nvl的内存,所以是0
+    # 这里注意allow_nvlink_for_low_latency_mode,如果这个是true,就会开ar,会走link
+    # 否则ll模式就不会开ar,  是否开ar用 环境变量来控制,这里根据这个标志来修改环境变量
     buffer = deep_ep.Buffer(group,
                             num_rdma_bytes=num_rdma_bytes,
                             low_latency_mode=True,
@@ -266,6 +293,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                             explicitly_destroy=True,
                             allow_mnnvl=args.allow_mnnvl,
                             enable_shrink=args.shrink_test)
+    # 申请完buffer后,开始测试
     test_main(num_tokens,
               hidden,
               num_experts,

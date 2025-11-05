@@ -327,23 +327,35 @@ __device__ static __forceinline__ void ibgda_write_empty_recv_wqe(void* out_wqe)
     st_na_relaxed(reinterpret_cast<int4*>(data_seg_ptr), *reinterpret_cast<const int4*>(&data_seg));
 }
 
+/**
+req_rptr：远端内存地址（remote pointer）
+req_lptr：本地内存地址（local pointer）
+bytes：本次要发送的数据大小
+dst_pe：目标 PE（Processing Element，通常就是目标 GPU 编号）
+qp_id：使用的 RDMA Queue Pair 编号
+lane_id：线程在 warp 中的 lane index（0~31）
+message_idx：消息索引（用于提交 WQE）
+ * 
+ */
 template <bool kAlwaysDoPostSend = false>
 __device__ static __forceinline__ void nvshmemi_ibgda_put_nbi_warp(
     uint64_t req_rptr, uint64_t req_lptr, size_t bytes, int dst_pe, int qp_id, int lane_id, int message_idx) {
     // Get lkey and rkey, store them into lanes
-    uint32_t num_wqes = 0;
-    __be32 my_lkey = 0;
-    uint64_t my_laddr = 0;
-    __be32 my_rkey = 0;
-    uint64_t my_raddr = 0;
-    uint64_t my_chunk_size = 0;
+    uint32_t num_wqes = 0; //本次 warp 需要生成的 WQE（Work Queue Element）数量
+    __be32 my_lkey = 0; //本地内存 key（local key） RDMA 硬件用 lkey 来访问 GPU 映射的本地内存(显存?)
+    uint64_t my_laddr = 0; //本地内存地址（local address） 对应 WQE 的源地址
+    __be32 my_rkey = 0;    //远端内存 key（remote key） RDMA 硬件用 rkey 来访问远端的 GPU 映射的本地内存
+    uint64_t my_raddr = 0; // 远端内存地址
+    uint64_t my_chunk_size = 0; //当前线程负责的这一块数据的大小
 
     auto qp = ibgda_get_rc(dst_pe, qp_id);
 
     // Decide how many messages (theoretically 3 for maximum)
-    auto remaining_bytes = bytes;
+    auto remaining_bytes = bytes; //要发送的所有数据
     while (remaining_bytes > 0) {
+        // 随着num_wqes增加 现成也会增加, 这里为什么没有用展开的方式?
         if (lane_id == num_wqes) {
+            // 剩余的字节 / 最大能发送的字节
             my_chunk_size = min(remaining_bytes,
                                 ibgda_get_lkey_and_rkey(my_laddr = req_lptr, &my_lkey, req_rptr, dst_pe, &my_raddr, &my_rkey, qp->dev_idx));
         }
@@ -357,6 +369,7 @@ __device__ static __forceinline__ void nvshmemi_ibgda_put_nbi_warp(
     }
     EP_DEVICE_ASSERT(num_wqes <= 32);
 
+    // 上面知识写了指令, 并没有真正的传输
     // Process WQE
     uint64_t base_wqe_idx = 0;
     if (lane_id == 0)
@@ -364,7 +377,9 @@ __device__ static __forceinline__ void nvshmemi_ibgda_put_nbi_warp(
     base_wqe_idx = __shfl_sync(0xffffffff, base_wqe_idx, 0);
     if (lane_id < num_wqes) {
         auto wqe_idx = base_wqe_idx + lane_id;
+        //获取 WQE 指针
         auto wqe_ptr = ibgda_get_wqe_ptr(qp, wqe_idx);
+        // 填充 WQE
         ibgda_write_rdma_write_wqe(qp, my_laddr, my_lkey, my_raddr, my_rkey, my_chunk_size, wqe_idx, &wqe_ptr);
     }
     __syncwarp();

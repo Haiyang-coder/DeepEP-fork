@@ -24,6 +24,7 @@ __global__ void get_dispatch_layout(const topk_idx_t* topk_idx,
     int expert_begin_idx = sm_id * kNumExpertsPerSM, expert_end_idx = min(expert_begin_idx + kNumExpertsPerSM, num_experts);
     if (expert_begin_idx < expert_end_idx) {
         // Per-thread count
+        // 展开循环, 用同步的方式来执行这个循环
         #pragma unroll
         for (int i = 0; i < kNumExpertsPerSM; ++i)
             num_tokens_per_expert_per_thread[thread_id][i] = 0;
@@ -37,6 +38,8 @@ __global__ void get_dispatch_layout(const topk_idx_t* topk_idx,
                     ++num_tokens_per_expert_per_thread[thread_id][expert_idx - expert_begin_idx];
             }
         }
+        // 这里同步的原因是让每个线程在同步内存中都写完信息
+        // 后面会开始用这些同步信息
         __syncthreads();
 
         // Sum up
@@ -98,6 +101,7 @@ __global__ void get_dispatch_layout(const topk_idx_t* topk_idx,
             for (int j = 0; j + rdma_rank_begin_idx < rdma_rank_end_idx; ++j)
                 num_tokens_per_rdma_rank_per_thread[thread_id][j] += (is_in_rdma_rank[j] > 0);
         }
+        //它让同一个 block（也就是同一个 SM 上的线程组）里的所有线程都等到彼此都执行到这一行之后，才继续往下执行
         __syncthreads();
 
         // Sum up
@@ -130,10 +134,14 @@ void get_dispatch_layout(const topk_idx_t* topk_idx,
                          int num_ranks,
                          int num_experts,
                          cudaStream_t stream) {
+    // 每个 block 启动 256 个线程, 每个 block 负责统计 4 个 experts, 每个 block 负责统计 8 个 ranks
     constexpr int kNumThreads = 256, kNumExpertsPerSM = 4, kNumRanksPerSM = 8;
+    // 每个 SM 负责统计的 experts 和 ranks 的数量, 总的 SM 数为两者之和
+    // 这么计算是为了向上取整 10 / 4 = 2 ((10 + 4 - 1) / 4 = 13 / 4 = 3)
     int num_sms = ((num_experts + kNumExpertsPerSM - 1) / kNumExpertsPerSM) + (num_ranks + kNumRanksPerSM - 1) / kNumRanksPerSM;
     EP_STATIC_ASSERT(kNumRanksPerSM % NUM_MAX_NVL_PEERS == 0, "Invalid number of ranks per SM");
 
+    // 这配置了 kernel的启动资源
     SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
     LAUNCH_KERNEL(&cfg,
                   (get_dispatch_layout<kNumThreads, kNumExpertsPerSM, kNumRanksPerSM>),

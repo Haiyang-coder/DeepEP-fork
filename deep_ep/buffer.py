@@ -64,6 +64,7 @@ class Buffer:
         check_nvlink_connections(group)
 
         # Initialize the CPP runtime
+        # 就是将cpp代码汇中的buffer类初始化，并将rank和group_size等信息传递给cpp代码
         if group is not None:
             self.rank = group.rank()
             self.group = group
@@ -87,14 +88,17 @@ class Buffer:
         self.low_latency_mode = low_latency_mode
         self.explicitly_destroy = explicitly_destroy
         self.enable_shrink = enable_shrink
+        # 这里转到了cpp模块完成真正的内存申请
         self.runtime = deep_ep_cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode, explicitly_destroy,
                                           enable_shrink)
 
         # Synchronize device IDs
+        # 在上面完成了cuda的显存申请
         local_device_id = self.runtime.get_local_device_id()
         device_ids = all_gather_object(local_device_id)
 
         # Synchronize IPC handles
+        # 这里吧申请的ipc_handle同步到所有进程上
         local_ipc_handle = self.runtime.get_local_ipc_handle()
         ipc_handles = all_gather_object(local_ipc_handle)
 
@@ -104,7 +108,7 @@ class Buffer:
             # Enable IBGDA
             assert num_qps_per_rank > 0
             os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
-            os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
+            os.environ['NVdSHMEM_IB_ENABLE_IBGDA'] = '1'
             os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
 
             # Make sure QP depth is always larger than the number of on-flight WRs, so that we can skip WQ slot check
@@ -173,6 +177,7 @@ class Buffer:
     @staticmethod
     def get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
         """
+        这里计算是按照BF16来的
         Get a minimum size requirement for the RDMA buffer. The size calculation will be done with BF16.
 
         Arguments:
@@ -318,7 +323,7 @@ class Buffer:
 
     # noinspection PyTypeChecker
     def dispatch(self, x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-                 handle: Optional[Tuple] = None,
+                 handle: Optional[Tuple] = None, # 缓存上次分发的局部信息
                  num_tokens_per_rank: Optional[torch.Tensor] = None, num_tokens_per_rdma_rank: Optional[torch.Tensor] = None,
                  is_token_in_rank: Optional[torch.Tensor] = None, num_tokens_per_expert: Optional[torch.Tensor] = None,
                  topk_idx: Optional[torch.Tensor] = None, topk_weights: Optional[torch.Tensor] = None,
@@ -367,6 +372,11 @@ class Buffer:
             handle: the returned communication handle.
             event: the event after executing the kernel (valid only if `async_finish` is set).
         """
+        # 获取调度配置
+        # 判断是不是多机
+        # 看是不是首次分发,如果不是，可以复用上次的token映射矩阵
+
+
         # Default config
         config = self.get_dispatch_config(self.group_size) if config is None else config
 
@@ -552,6 +562,26 @@ class Buffer:
                              async_finish: bool = False, return_recv_hook: bool = False) -> \
             Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         """
+         x: torch.Tensor,  # 输入的token, 类型bfloat16, 形状[num_tokens, hidden], 只支持部分hidden大小
+        topk_idx: torch.Tensor,  # 每个token的top-k expert索引, 通常为int64, 形状[num_tokens, num_topk], -1表示不选择任何expert
+        num_max_dispatch_tokens_per_rank: int,  # 每个rank最多分发的token数量, 所有rank必须相同
+        num_experts: int,  # 所有expert的总数量
+        cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,  # 可选, 本地每个expert接收token的累计统计, 形状[num_local_experts], 类型int
+        dispatch_wait_recv_cost_stats: Optional[torch.Tensor] = None,  # 可选, 每个token等待接收的耗时统计, 形状[num_ranks, num_ranks], 类型int64
+        use_fp8: bool = True,  # 是否启用FP8类型传输, 若True, recv_x会返回(FP8 tensor, scaling factors)  这里开启量化
+        round_scale: bool = False,  # 是否将scaling factor四舍五入到2的幂次, 仅在use_fp8=True时有效
+        use_ue8m0: bool = False,  # 是否使用UE8M0格式存储scaling factor, 仅在round_scale=True时有效
+        async_finish: bool = False,  # 是否异步执行, True时当前stream不会等待通信kernel完成
+        return_recv_hook: bool = False  # 是否返回接收hook, True时kernel只发起RDMA请求, 不立即接收数据
+        ) -> Tuple[
+        Tuple[torch.Tensor, torch.Tensor],  # recv_x: 每个expert接收到的token, use_fp8=True时为(FP8 tensor, scaling factors), 否则为bfloat16 tensor
+        torch.Tensor,  # recv_count: 每个本地expert实际接收到的token数量, 形状[num_local_experts], 类型int
+        Tuple,  # handle: low_latency_combine函数用的通信句柄
+        EventOverlap,  # event: 仅当async_finish=True时有效, 表示kernel执行完成
+        Callable  # hook: 仅当return_recv_hook=True时有效, 用于手动触发接收
+        ]:
+        """
+        """
         A low-latency implementation for dispatching with IBGDA.
         This kernel requires all the ranks (no matter intranode or internode) should be visible via RDMA
             (specifically, IBGDA must be enabled).
@@ -598,6 +628,10 @@ class Buffer:
             event: the event after executing the kernel (valid only if `async_finish` is set).
             hook: the receiving hook function (valid only if `return_recv_hook` is set).
         """
+        # 补充一下 ,在normal模式里面, 用户这里是自己做的量化, 然后传进来
+        # ll模式 直接是标志位, 一块量化了
+
+        #提前设置qp数量
         assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
         packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
             self.runtime.low_latency_dispatch(x, topk_idx,
@@ -670,7 +704,18 @@ class Buffer:
         """
         self.runtime.low_latency_update_mask_buffer(rank_to_mask, mask)
 
-    def low_latency_query_mask_buffer(self, mask_status: torch.Tensor):
+    def low_latency_query_mask_buffer(self, rank_to_mask: int, mask: bool = False):
+        """
+        Mask (unmask) a rank during communication (dispatch, combine, and clean)
+
+        Arguments:
+            rank: the rank to mask (unmask).
+            mask: if True, will mask the rank (do not recvfrom/sendto the rank), otherwise will unmask the rank.
+
+        """
+        self.runtime.low_latency_update_mask_buffer(rank_to_mask, mask)    
+
+    def low_latency_get_x_isTokenSend(self, x: int,  is_token_send: int):
         """
         Query the mask status of all ranks
 
@@ -678,7 +723,7 @@ class Buffer:
             mask_status: `[num_ranks]` with `torch.int`, the mask status of each rank. `1` means mask and `0` means unmasked.
 
         """
-        self.runtime.low_latency_query_mask_buffer(mask_status)
+        self.runtime.low_latency_get_x_isTokenSend(x , is_token_send)
 
     def low_latency_clean_mask_buffer(self):
         """

@@ -28,8 +28,10 @@ Buffer::Buffer(int rank,
       enable_shrink(enable_shrink),
       low_latency_mode(low_latency_mode),
       explicitly_destroy(explicitly_destroy),
-      comm_stream(at::cuda::getStreamFromPool(true)) {
+      comm_stream(at::cuda::getStreamFromPool(true)) {// 通信流,下面还有计算流,现在是两个流
     // Metadata memory
+    //每个机器有多少个peers
+    // 这个就是保存在host上面的指针指向了device上面的内存, 这些是指针占用的空间
     int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
     int64_t buffer_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(void*);
     int64_t barrier_signal_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(int*);
@@ -64,9 +66,13 @@ Buffer::Buffer(int rank,
     EP_HOST_ASSERT(ceil_div<int64_t>(num_nvl_bytes, num_device_sms / 2) < std::numeric_limits<int>::max());
     EP_HOST_ASSERT(ceil_div<int64_t>(num_rdma_bytes, num_device_sms / 2) < std::numeric_limits<int>::max());
 
+    // 这一块在 ll模式下面不会执行, ll模式用不到nvl
     if (num_nvl_bytes > 0) {
         // Local IPC: alloc local memory and set local IPC handles
+        //用的cudaMalloc, 是在local memory 上面分配的
+        //三个指针, 一大块内存
         CUDA_CHECK(cudaMalloc(&buffer_ptrs[nvl_rank], num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes));
+        //这个ipc是多GPU的共享机制,可以访问另一个GPU的内存
         CUDA_CHECK(cudaIpcGetMemHandle(&ipc_handles[nvl_rank], buffer_ptrs[nvl_rank]));
         buffer_ptrs_gpu = reinterpret_cast<void**>(static_cast<uint8_t*>(buffer_ptrs[nvl_rank]) + num_nvl_bytes + barrier_signal_bytes);
 
@@ -208,6 +214,9 @@ void Buffer::destroy() {
     available = false;
 }
 
+// 这里的同步分成两步
+// 第一步是nvl的同步,这个同步是自己完成的(malloc 已经在前面完成了)
+// 第二部是rdma的内存申请 + 同步, 这个同步是利用nvshmem的函数实现的
 void Buffer::sync(const std::vector<int>& device_ids,
                   const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles,
                   const std::optional<pybind11::bytearray>& root_unique_id_opt) {
@@ -217,13 +226,21 @@ void Buffer::sync(const std::vector<int>& device_ids,
     if (num_nvl_bytes > 0) {
         EP_HOST_ASSERT(num_ranks == device_ids.size());
         EP_HOST_ASSERT(device_ids.size() == all_gathered_handles.size());
+        // 在全局收集到的句柄数组 all_gathered_handles 中，找到当前 RDMA 组（即当前节点）对应的起始位置。
+        // rdma_rank = rank / NUM_MAX_NVL_PEERS
+        // num_nvl_ranks = std::min(num_ranks, NUM_MAX_NVL_PEERS)
         for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++i) {
+            //每个 rank 从 all_gathered_handles 拿到别的 GPU 的共享句柄
+            //all_gathered_handles 是所有 rank（跨所有节点）收集的 CUDA IPC 句柄
             EP_HOST_ASSERT(all_gathered_handles[offset + i].has_value());
             auto handle_str = std::string(all_gathered_handles[offset + i].value());
             EP_HOST_ASSERT(handle_str.size() == CUDA_IPC_HANDLE_SIZE);
+            // 这个条件是保证当然得rank在同一节点内部, 但是不是同一个卡
             if (offset + i != rank) {
                 std::memcpy(ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE);
                 CUDA_CHECK(cudaIpcOpenMemHandle(&buffer_ptrs[i], ipc_handles[i], cudaIpcMemLazyEnablePeerAccess));
+                // 每一个卡都会把全局的nvl缓存放到barrier_signal_ptrs
+                // 从all_gathered_handles获取,然后自己构造这个结构体
                 barrier_signal_ptrs[i] = reinterpret_cast<int*>(static_cast<uint8_t*>(buffer_ptrs[i]) + num_nvl_bytes);
             } else {
                 EP_HOST_ASSERT(std::memcmp(ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE) == 0);
@@ -246,10 +263,15 @@ void Buffer::sync(const std::vector<int>& device_ids,
         std::memcpy(root_unique_id.data(), root_unique_id_str.c_str(), root_unique_id_opt->size());
         auto nvshmem_rank = low_latency_mode ? rank : rdma_rank;
         auto num_nvshmem_ranks = low_latency_mode ? num_ranks : num_rdma_ranks;
+        // 这里是初始化nvshmem的通信组
+        //传入当前进程的rank号, 通信组的rank数量, 通信组id
         EP_HOST_ASSERT(nvshmem_rank == internode::init(root_unique_id, nvshmem_rank, num_nvshmem_ranks, low_latency_mode));
+        // 第一次同步,完成nvshmem的初始化
         internode::barrier();
 
         // Allocate
+        // rdma的空间，内部调用的是nvshmem接口nvshmem_align(alignment, size)
+        // 在所有pe的HBM上都分配一块大小为size的对称空间
         rdma_buffer_ptr = internode::alloc(num_rdma_bytes, NUM_BUFFER_ALIGNMENT_BYTES);
 
         // Clean buffer (mainly for low-latency mode)
@@ -266,6 +288,9 @@ void Buffer::sync(const std::vector<int>& device_ids,
         }
 
         // Barrier
+        //所有 PE（GPU）必须都到达这个屏障，才能继续执行。
+        // nvshmem_barrier_all() 里面调用的这个函数
+        //第二次同步, 目的是完成内存的分配和初始化, 保证所有PE都已经完成了内存的分配
         internode::barrier();
         CUDA_CHECK(cudaDeviceSynchronize());
     }
@@ -305,6 +330,7 @@ Buffer::get_dispatch_layout(
     if (is_internode_available())
         num_tokens_per_rdma_rank = torch::empty({num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
 
+    // 这里会启动cuda kernel 异步启动
     layout::get_dispatch_layout(topk_idx.data_ptr<topk_idx_t>(),
                                 num_tokens_per_rank.data_ptr<int>(),
                                 num_tokens_per_rdma_rank.has_value() ? num_tokens_per_rdma_rank.value().data_ptr<int>() : nullptr,
@@ -320,9 +346,11 @@ Buffer::get_dispatch_layout(
     std::optional<EventHandle> event;
     if (async) {
         event = EventHandle(comm_stream);
+        //record_stream(comm_stream) 告诉 PyTorch/CUDA：这个 tensor 的数据生命周期绑定到通信流；
         for (auto& t : {topk_idx, num_tokens_per_rank, num_tokens_per_expert, is_token_in_rank}) {
             t.record_stream(comm_stream);
             if (allocate_on_comm_stream)
+            //如果 allocate_on_comm_stream == True，那它还会在 compute_stream 上再记录一次，表示这块显存也会被计算流访问。
                 t.record_stream(compute_stream);
         }
         for (auto& to : {num_tokens_per_rdma_rank}) {
@@ -1401,6 +1429,9 @@ void Buffer::clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int 
 #endif
 }
 
+
+
+
 std::tuple<torch::Tensor,
            std::optional<torch::Tensor>,
            torch::Tensor,
@@ -1409,19 +1440,20 @@ std::tuple<torch::Tensor,
            std::optional<EventHandle>,
            std::optional<std::function<void()>>>
 Buffer::low_latency_dispatch(const torch::Tensor& x,
-                             const torch::Tensor& topk_idx,
+                             const torch::Tensor& topk_idx,//ll模式下 仅仅依靠topk_idx来将token分发出去
                              const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
                              const std::optional<torch::Tensor>& dispatch_wait_recv_cost_stats,
                              int num_max_dispatch_tokens_per_rank,
                              int num_experts,
-                             bool use_fp8,
+                             bool use_fp8,//一个use_fp8的参数，如果是true，那么dispatch内部会将传入的bf16的x数据量化成fp8再发送出去
                              bool round_scale,
                              bool use_ue8m0,
                              bool async,
-                             bool return_recv_hook) {
+                             bool return_recv_hook) {//如果设置了这个参数，那么dispatch函数只会发送RDMA的请求，但是不会真正接收到数据，而是马上返回给用户一个hook，用户可以调用这个hook来确保真正收到数据
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(low_latency_mode);
-
+    // 下面这么多的断言这段代码主要是在 调度/分发张量到专家（experts） 前做的一些 输入合法性检查。
+                            
     // Tensor checks
     // By default using `ptp128c` FP8 cast
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
@@ -1443,6 +1475,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
         EP_HOST_ASSERT(dispatch_wait_recv_cost_stats->size(0) == num_ranks);
     }
 
+    // 初始化参数
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
     auto num_topk = static_cast<int>(topk_idx.size(1));
     auto num_local_experts = num_experts / num_ranks;
@@ -1458,15 +1491,27 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
+    // return_recv_hook=true：通信和计算在同一个流中顺序执行，方便用户在通信结束后立即在同一流继续执行后续逻辑；
+    // return_recv_hook=false：通信和计算分开执行，可以并行。
     if (not return_recv_hook)
+        //launch_stream 等待 compute_stream 上的任务完成
+        // compute_stream效率高, comm等待
         stream_wait(launch_stream, compute_stream);
 
     // Allocate packed tensors
+
+    //接收专家输出的张量，用于存放专家输出的数据
+    //如果 use_fp8=true → 使用 torch::kFloat8_e4m3fn（FP8 8-bit 浮点数，E4M3 格式）
+    //如果 use_fp8=false → 使用 torch::kBFloat16（16-bit bfloat16）
     auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
                                       x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16));
+    //token的来源信息, 每个专家最多接收的token数量，用于追踪每个专家接收token的来源, 用的int32                                 
     auto packed_recv_src_info =
         torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+    
+    //[num_local_experts, num_ranks] 某个专家从某个 rank 收到的 token 的起止位置/范围。这个要做前缀和
     auto packed_recv_layout_range = torch::empty({num_local_experts, num_ranks}, torch::dtype(torch::kInt64).device(torch::kCUDA));
+    //[num_local_experts] 一维张量，每个元素对应 一个本地专家, 本地专家收到多少token数量
     auto packed_recv_count = torch::empty({num_local_experts}, torch::dtype(torch::kInt32).device(torch::kCUDA));
 
     // Allocate column-majored scales
@@ -1474,6 +1519,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
     void* packed_recv_x_scales_ptr = nullptr;
     EP_HOST_ASSERT((num_ranks * num_max_dispatch_tokens_per_rank) % 4 == 0 and "TMA requires the number of tokens to be multiple of 4");
 
+    //如果用了量化,就在这里给scale赋值
     if (use_fp8) {
         // TODO: support unaligned cases
         EP_HOST_ASSERT(hidden % 512 == 0);
@@ -1718,6 +1764,11 @@ void Buffer::low_latency_clean_mask_buffer() {
     internode_ll::clean_mask_buffer(mask_buffer_ptr, num_ranks, at::cuda::getCurrentCUDAStream());
 }
 
+
+void Buffer::low_latency_get_x_isTokenSend(const torch::Tensor& x , const torch::Tensor& is_token) {
+  
+}
+
 }  // namespace deep_ep
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1761,6 +1812,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("low_latency_combine", &deep_ep::Buffer::low_latency_combine)
         .def("low_latency_update_mask_buffer", &deep_ep::Buffer::low_latency_update_mask_buffer)
         .def("low_latency_query_mask_buffer", &deep_ep::Buffer::low_latency_query_mask_buffer)
+        .def("low_latency_get_x_isTokenSend", &deep_ep::Buffer::low_latency_get_x_isTokenSend)
         .def("low_latency_clean_mask_buffer", &deep_ep::Buffer::low_latency_clean_mask_buffer)
         .def("get_next_low_latency_combine_buffer", &deep_ep::Buffer::get_next_low_latency_combine_buffer);
 

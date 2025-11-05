@@ -13,11 +13,13 @@ from typing import Optional, Union
 
 def init_dist(local_rank: int, num_local_ranks: int):
     # NOTES: you may rewrite this function with your own cluster settings
+    # 从环境变量中获取主节点的链接信息ip port, 节点编号, 卡号
     ip = os.getenv('MASTER_ADDR', '127.0.0.1')
     port = int(os.getenv('MASTER_PORT', '8361'))
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
     node_rank = int(os.getenv('RANK', 0))
 
+    # 构建通信参数,用nccl通信,通信的规模,本卡rank号
     sig = inspect.signature(dist.init_process_group)
     params = {
         'backend': 'nccl',
@@ -46,13 +48,18 @@ def calc_diff(x: torch.Tensor, y: torch.Tensor):
 def align_up(x, y):
     return (x + y - 1) // y * y
 
-
+# 返回值
+# 量化后的矩阵 形状是 [m, n]（跟原始输入相同）
+# 量化系数 [m, aligned_n(n向上128对齐) / 128]
 def per_token_cast_to_fp8(x: torch.Tensor):
     assert x.dim() == 2
     m, n = x.shape
+    # 把n向上对齐到128
     aligned_n = align_up(n, 128)
     x_padded = torch.nn.functional.pad(x, (0, aligned_n - n), mode='constant', value=0)
+    # 把每行再分成若干个长度为 128 的小块。
     x_padded_view = x_padded.view(m, -1, 128)
+    # 对每个块（128个元素）取绝对值，得到每块的最大幅值 x_amax，形状 [m, aligned_n/128]。
     x_amax = x_padded_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
     return (x_padded_view * (448.0 / x_amax.unsqueeze(2))).to(torch.float8_e4m3fn).view(
         m, aligned_n)[:, :n].contiguous(), (x_amax / 448.0).view(m, -1)

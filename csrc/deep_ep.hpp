@@ -263,6 +263,8 @@ public:
     void low_latency_query_mask_buffer(const torch::Tensor& mask_status);
 
     void low_latency_clean_mask_buffer();
+
+    void low_latency_get_x_isTokenSend(const torch::Tensor& x , const torch::Tensor& is_token);
 };
 
 }  // namespace deep_ep

@@ -127,18 +127,18 @@ void clean_low_latency_buffer(int* clean_0,
 }
 
 template <bool kUseFP8, bool kUseUE8M0, int kHidden>
-__global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
-                                                    void* packed_recv_x_scales,
-                                                    int* packed_recv_src_info,
-                                                    int64_t* packed_recv_layout_range,
-                                                    int* packed_recv_count,
+__global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,// num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden
+                                                    void* packed_recv_x_scales,//这个根据量化的不同,这个维度也不同num_local_experts, hidden / 512, num_ranks * num_max_dispatch_tokens_per_rank  或者 num_local_experts, hidden / 128, num_ranks * num_max_dispatch_tokens_per_rank
+                                                    int* packed_recv_src_info,// num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank 每个专家最多接收这么多token
+                                                    int64_t* packed_recv_layout_range,//[num_local_experts, num_ranks] 某个专家从某个 rank 收到的 token 的起止位置/范围。这个要做前缀和
+                                                    int* packed_recv_count,// //[num_local_experts] 一维张量，每个元素对应 一个本地专家, 本地专家收到多少token数量
                                                     int* mask_buffer_ptr,
                                                     int* cumulative_local_expert_recv_stats,
                                                     int64_t* dispatch_wait_recv_cost_stats,
                                                     void* rdma_recv_x,
                                                     int* rdma_recv_count,
-                                                    void* rdma_x,
-                                                    const void* x,
+                                                    void* rdma_x, //dispatch_rdma_send_buffer,发送显存
+                                                    const void* x, // token矩阵
                                                     const topk_idx_t* topk_idx,
                                                     int* atomic_counter_per_expert,
                                                     int* atomic_finish_counter_per_expert,
@@ -154,10 +154,14 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                                                     int num_warps_per_group,
                                                     bool round_scale,
                                                     int phases) {
-    const auto sm_id = static_cast<int>(blockIdx.x);
-    const auto thread_id = static_cast<int>(threadIdx.x);
-    const auto warp_id = thread_id / 32, lane_id = get_lane_id();
-    const auto num_sms = static_cast<int>(gridDim.x);
+    // 计算可以使用的计算资源
+    //blockIdx 是 CUDA 内置的变量，编译器自动提供
+    //它在 每个 kernel 执行时由 GPU 自动赋值
+    //类型是 dim3，表示 当前线程所在 block 在 grid 中的索引
+    const auto sm_id = static_cast<int>(blockIdx.x); 
+    const auto thread_id = static_cast<int>(threadIdx.x); 
+    const auto warp_id = thread_id / 32, lane_id = get_lane_id();//当前线程在warp中索引
+    const auto num_sms = static_cast<int>(gridDim.x); // 当前grid中的block的数量
     const auto num_warps = num_warp_groups * num_warps_per_group;
     const auto num_local_experts = num_experts / num_ranks;
     const auto warp_group_id = warp_id / num_warps_per_group;
@@ -165,26 +169,36 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     const auto responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
 
     // May extract UE8M0 from the scales
+    // 条件判断, 如果kUseUE8M0 = true scale_t = uint8_t, 否则 scale_t = float 存 量化系数（scale）
     using scale_t = std::conditional_t<kUseUE8M0, uint8_t, float>;
+    // 存 打包后的 FP8 数据 但 warp 为了效率，会把多个 FP8 打包成一个 32 位或 64 位单元
     using packed_t = std::conditional_t<kUseUE8M0, uint32_t, float>;
     EP_STATIC_ASSERT(sizeof(packed_t) % sizeof(scale_t) == 0, "Invalid vector length");
 
     // FP8 staffs
+    // 把hidden 分成128一组
     constexpr int kNumPerChannels = 128;
     const int num_scales = kHidden / kNumPerChannels;
+    // 计算 用fp8 还是 bf16 作为 hidden_bytes的量化
     const size_t hidden_bytes = kHidden * (kUseFP8 ? sizeof(__nv_fp8_storage_t) : sizeof(nv_bfloat16));
+    //cuda内部的int4类型
     const size_t hidden_int4 = hidden_bytes / sizeof(int4);
 
     // Message package: index at source (int), 3 reserved int fields, hidden data, FP8 scales
     // NOTES: currently we have 3 reserved int fields for future use
     using vec_t = std::conditional_t<kUseFP8, int2, int4>;
+    // 消息头 + hidden(这里传入的是量化的值) + scales + 量化的大小
     const size_t num_bytes_per_msg = sizeof(int4) + (kUseFP8 ? (kHidden + num_scales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
 
     // Expert counts
     constexpr int kNumMaxWarpGroups = 32;
+    //_shared__ 是 CUDA 的 共享内存，block 内所有线程共享
     __shared__ int shared_num_tokens_sent_per_expert[kNumMaxWarpGroups];
+
+    // 上面是公共资源的计算,下面这个判断将ll_dispatch一分为二
+    // 如果这里选择的send模式,继续执行,如果是recv模式,跳转                                                  
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -194,35 +208,53 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     // 1. The first-kind warps for FP8 cast and sending top-k tokens
     // 2. The last warp for reading `topk_idx` and count for per-expert information
     if (warp_id < num_warps - 1) {
+        // 负责量化, 打包, 发送数据
+        // cuda一次读 int4 , 发送用的是 nv_bfloat16
         constexpr int kNumElemsPerRead = sizeof(int4) / sizeof(nv_bfloat16);
         EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerRead) == 0, "Invalid hidden");
         EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kNumPerChannels == 0, "Invalid vectorization");
+        //用来做工作的线程数, 减一是因为最后一个warp是用来计数和读取topk_idx的
         const auto num_threads = (num_warps - 1) * 32;
+        // 分几次读完, 后面的循环可以用这个值来
         const size_t hidden_bf16_int4 = kHidden / kNumElemsPerRead;
-
+        // 遍历所有token, 每个sm 负责一个, 所以一个循环周期就是num_sms, 每次发送num_sms个token,直到tokens用完
         for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
+            //x 是bf16的指针, 指向了开始的地方,每次循环都会移动
             const auto x_int4 = static_cast<const int4*>(x) + token_idx * hidden_bf16_int4;
+            //指向 当前 token 在 RDMA buffer 的起始位置
             const auto rdma_x_src_idx = reinterpret_cast<int*>(static_cast<uint8_t*>(rdma_x) + token_idx * num_bytes_per_msg);
+            //跳过数据头 指向数据位置
             const auto rdma_x_vec = reinterpret_cast<vec_t*>(reinterpret_cast<uint8_t*>(rdma_x_src_idx) + sizeof(int4));
+            //跳过了 hidden部分, 直接指向 scales 部分
             const auto rdma_x_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(rdma_x_vec) + hidden_bytes);
 
             // Overlap top-k index read and source token index writes
+            //这里只需要topk个warp
+            //这个内存是 只读的，可以利用 只读数据缓存 
             auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
+            // 这里有疑问, 调度的最小单位不是warp吗  为什么这里是用thread
             thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
 
             // FP8 cast
+            // 上面拷贝了 token_idx 下面就是拷贝token数据
             EP_STATIC_ASSERT(hidden_bf16_int4 % 32 == 0, "Must use the full warp to reduce");
             #pragma unroll
+            // cuda一次读取 int4, 一个token需要 hidden_bf16_int4拷贝结束
+            // 一轮拷贝,并行num_threads个拷贝
             for (int i = thread_id; i < hidden_bf16_int4; i += num_threads) {
                 // Read
                 auto int4_value = __ldg(x_int4 + i);
 
                 if constexpr (kUseFP8) {
+                    //如果量化了, 需要计算量化,并把量化的scale进行填充
                     // Calculate local amax
                     auto bf16_values = reinterpret_cast<nv_bfloat16*>(&int4_value);
+                    // 一次读int4 ,nv_bfloat16的数据可以分成kNumElemsPerRead次
+                    // 所以把数据分成了 kNumElemsPerRead 块 , 存入了 fp32_values中
                     float fp32_values[kNumElemsPerRead];
                     float amax = kFP8Margin, scale, scale_inv;
                     #pragma unroll
+                    // 计算当前线程负责的kNumElemsPerRead个值中的绝对值最大值
                     for (int j = 0; j < kNumElemsPerRead; ++j) {
                         fp32_values[j] = static_cast<float>(bf16_values[j]);
                         amax = fmaxf(amax, fabsf(fp32_values[j]));
@@ -231,36 +263,50 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                     // Reduce amax and scale
                     EP_STATIC_ASSERT(kNumElemsPerRead * 32 / kNumPerChannels == 2, "Invalid vectorization");
                     amax = warp_reduce_max<16>(amax);
+                    // 计算并存储Scale
                     calculate_fp8_scales(amax, scale, scale_inv, round_scale);
+                    //（lane_id 0和16）负责写入scale值
                     if (lane_id == 0 or lane_id == 16)
+                        //将scale写入
                         rdma_x_scales[i * kNumElemsPerRead / 128] = scale_inv;
 
                     // Cast into send buffer
-                    vec_t int2_value;
+                    // 缩放与类型转换
+                    vec_t int2_value;// FP8时，vec_t是int2（64位）
                     auto fp8x2_values = reinterpret_cast<__nv_fp8x2_storage_t*>(&int2_value);
                     #pragma unroll
                     for (int j = 0; j < kNumElemsPerRead; j += 2) {
                         float2 fp32x2 = {fp32_values[j] * scale, fp32_values[j + 1] * scale};
+                        // 将两个float32值转换为一个fp8x2（16位）
                         fp8x2_values[j / 2] = __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE, __NV_E4M3);
                     }
+                     // 将量化后的数据写入发送缓冲区
                     rdma_x_vec[i] = int2_value;
                 } else {
                     // Reinterpret-cast is for C++14 compatibility
+                    // 如果没有进行量化, 就直接把数据写上, 没有量化就是int4
                     rdma_x_vec[i] = *reinterpret_cast<vec_t*>(&int4_value);
                 }
             }
+            //面的代码完成了每个block将一个token从x中拷贝到自己的GPU的dispatch_rdma_send_buffer中，接下来各个block需要将这个token从自己GPU的rdma_buffer中拷贝到目标专家所对应的rank的rdma_buffer中
+            //一个block中的一个warp负责该token到一个目标专家的拷贝，如果某个warp没有被分配到目标专家（dst_expert_idx < 0），那么就跳过
             asm volatile("bar.sync 1, %0;" ::"r"(num_threads));
 
             // Issue IBGDA sends
             if (dst_expert_idx >= 0) {
+                // 1. 获取写入槽位: Warp 的第一个线程对目标专家的全局计数器执行原子加
                 int slot_idx = lane_id == 0 ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0;
+                // 2. 广播槽位: 将该偏移广播给 Warp 内的所有线程
                 slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
+                // 3. 计算远程地址
                 const auto dst_rank = dst_expert_idx / num_local_experts;
                 const auto dst_expert_local_idx = dst_expert_idx % num_local_experts;
-                const auto src_ptr = reinterpret_cast<uint64_t>(rdma_x_src_idx);
+                const auto src_ptr = reinterpret_cast<uint64_t>(rdma_x_src_idx);// 本地发送缓冲区的源地址
+                // 远程接收缓冲区的目标地址 = 接收区基址 + 专家分区偏移 + 源Rank分区偏移 + token槽位偏移
                 const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
                     dst_expert_local_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                     rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg + slot_idx * num_bytes_per_msg;
+                // 4. 检查P2P路径并发送数据
                 const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
                 if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank)) {
                     if (dst_p2p_ptr == 0) {
@@ -274,13 +320,15 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                 }
 
                 // Increase counter after finishing
+                // 5. 更新完成计数器: 发送完成后，对另一个原子计数器+1，用于后续的同步
                 __syncwarp();
                 lane_id == 0 ? atomic_add_release_global(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
             }
         }
-    } else if (warp_id == num_warps - 1) {
+    } else if (warp_id == num_warps - 1) { //每个block中的最后一个warp会并行地进行数据统计，计算当前rank应该给每个专家发送多少token
         EP_DEVICE_ASSERT(num_sms > 1);
         if (sm_id == 0) {
+            // 也就是第一个block
             // The first SM is also responsible for checking QPs
             EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe >= num_local_experts);
 
